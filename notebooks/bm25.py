@@ -1,24 +1,32 @@
-"""Simple BM25 pipeline: PDF -> chunks -> BM25 index -> search.
+"""Simple BM25 pipeline: PDF -> chunks -> BM25 index -> pickle -> search.
 
 Reuses extract_pdf / chunk_text / FILING_REGISTRY from chroma_ingest.py,
-but skips Chroma entirely — chunks go straight into an in-memory BM25 index.
+but skips Chroma entirely — chunks go straight into an in-memory BM25 index,
+which is then pickled so query scripts never pay the PDF-extraction cost.
+
+Workflow:
+    python bm25_simple.py                      # BUILD: slow, run after any re-ingest
+    (other scripts)  from bm25_simple import load_index   # QUERY: instant
 
 Usage:
-    python bm25_simple.py                      # build index, run demo queries
-    python bm25_simple.py "your query here"    # build index, run your query
+    python bm25_simple.py                      # build + pickle + demo queries
+    python bm25_simple.py "your query here"    # build + pickle + your query
 """
 
 import logging
+import pickle
 import string
 import sys
 import time
 
 from rank_bm25 import BM25Okapi
 
-from chroma_ingest import FILING_REGISTRY, PDF_DIR, chunk_text, extract_pdf
+from chroma_ingest import FILING_REGISTRY, PDF_DIR, PROJECT_ROOT, chunk_text, extract_pdf
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
+
+BM25_PATH = PROJECT_ROOT / "bm25_index.pkl"
 
 _PUNCT = string.punctuation
 
@@ -57,6 +65,33 @@ def build_bm25(chunks: list[dict]) -> BM25Okapi:
     return bm25
 
 
+def save_index(bm25: BM25Okapi, chunks: list[dict]) -> None:
+    """Pickle the index and chunks TOGETHER — position i in bm25 is chunks[i].
+
+    Saving them as one bundle makes misalignment structurally impossible.
+    """
+    bundle = {"bm25": bm25, "chunks": chunks}
+    with open(BM25_PATH, "wb") as f:
+        pickle.dump(bundle, f)
+    log.info("Saved index to %s (%.1f MB)",
+             BM25_PATH, BM25_PATH.stat().st_size / 1e6)
+
+
+def load_index() -> dict:
+    """Load the pickled bundle: {"bm25": BM25Okapi, "chunks": list[dict]}.
+
+    Query scripts import and call this instead of rebuilding from PDFs.
+    """
+    if not BM25_PATH.exists():
+        raise FileNotFoundError(
+            f"{BM25_PATH} not found — run `python bm25_simple.py` first to build it."
+        )
+    with open(BM25_PATH, "rb") as f:
+        bundle = pickle.load(f)
+    log.info("Loaded BM25 index: %d chunks", len(bundle["chunks"]))
+    return bundle
+
+
 def search(query: str, bm25: BM25Okapi, chunks: list[dict], k: int = 5) -> list[tuple]:
     """Score all chunks for the query, return top-k as (chunk, score)."""
     scores = bm25.get_scores(tokenize(query))
@@ -73,8 +108,10 @@ def print_results(query: str, results: list[tuple]) -> None:
 
 
 def main() -> None:
+    """Builder entry point: PDFs -> chunks -> BM25 -> pickle, then demo queries."""
     chunks = build_chunks()
     bm25 = build_bm25(chunks)
+    save_index(bm25, chunks)
 
     queries = sys.argv[1:] or [
         "Item 7A quantitative and qualitative disclosures",
